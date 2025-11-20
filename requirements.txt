@@ -1,0 +1,8 @@
+opencv-python
+sounddevice
+numpy
+speedtest-cli
+rich
+scipy
+streamlit
+requests
