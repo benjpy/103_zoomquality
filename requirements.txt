@@ -3,7 +3,8 @@ numpy
 speedtest-cli
 rich
 scipy
-streamlit
+streamlit>=1.35.0
 requests
-streamlit-webrtc
+streamlit-webrtc>=0.47.0
+aiortc>=1.6.0
 
