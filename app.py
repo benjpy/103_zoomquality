@@ -3,10 +3,19 @@ import cv2
 import numpy as np
 import time
 import os
-from video_check import check_video_quality, draw_guide
-from audio_check import check_audio_quality, list_input_devices
+import datetime
+import requests
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+
+from video_check import VideoProcessor
+from audio_check import AudioRecorder, analyze_audio_file
 from network_check import check_network_quality
 from report import analyze_video_results, analyze_audio_results, analyze_network_results
+
+# RTC Configuration (STUN servers)
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 st.set_page_config(page_title="Video Call Quality Checker", page_icon="📹", layout="wide")
 
@@ -15,25 +24,18 @@ def get_star_rating(value, min_val, max_val, inverse=False):
     Convert a value to a 1-5 star string.
     """
     if value is None: return "N/A"
-    
-    # Normalize to 0-1
     if inverse:
         norm = 1 - ((value - min_val) / (max_val - min_val))
     else:
         norm = (value - min_val) / (max_val - min_val)
-        
     norm = max(0, min(1, norm))
     stars = int(norm * 5)
-    if stars == 0 and norm > 0: stars = 1 # At least 1 star if not 0
-    
+    if stars == 0 and norm > 0: stars = 1
     return "⭐" * stars + "☆" * (5 - stars)
-
-import requests
-import datetime
 
 def get_location():
     try:
-        response = requests.get("http://ip-api.com/json/")
+        response = requests.get("http://ip-api.com/json/", timeout=2)
         if response.status_code == 200:
             data = response.json()
             return f"{data.get('city')}, {data.get('country')}"
@@ -44,7 +46,7 @@ def get_location():
 st.title("📹 Video Call Quality Checker")
 st.markdown("Analyze your setup for Zoom, Teams, Meet, etc.")
 
-# Header Info (Time & Location)
+# Header Info
 col_h1, col_h2 = st.columns(2)
 with col_h1:
     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -55,233 +57,173 @@ with col_h2:
 
 if 'results' not in st.session_state:
     st.session_state.results = {}
+if 'workflow_state' not in st.session_state:
+    st.session_state.workflow_state = 'idle'  # idle, video, audio, network, complete
 
+# --- Sidebar ---
 with st.sidebar:
-    st.header("Settings")
+    st.header("Control Panel")
+    if st.button("Reset / New Check", type="secondary"):
+        st.session_state.results = {}
+        st.session_state.workflow_state = 'idle'
+        st.rerun()
+
+# --- Main Logic ---
+
+# 1. Start Screen
+if st.session_state.workflow_state == 'idle':
+    st.info("Click 'Start Analysis' to begin the checks. Browser permission will be requested for Camera and Microphone.")
+    if st.button("Start Analysis", type="primary"):
+        st.session_state.workflow_state = 'video'
+        st.rerun()
+
+# 2. Video Check
+elif st.session_state.workflow_state == 'video':
+    st.header("Step 1: Video Check")
+    st.info("Align your face in the oval. Wait for a few seconds of analysis, then click 'Finish Video Check'.")
     
-    # Audio Device Selection
-    input_devices = list_input_devices()
-    device_names = [d[1] for d in input_devices]
-    selected_device_name = st.selectbox("Microphone", device_names)
-    selected_device_index = next((d[0] for d in input_devices if d[1] == selected_device_name), None)
+    ctx = webrtc_streamer(
+        key="video-check",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
     
-    # Defaults
-    video_duration = 2
-    audio_duration = 5
-    
-    # Initialize Session State for Workflow
-    if 'workflow_state' not in st.session_state:
-        st.session_state.workflow_state = 'idle' # idle, preview, analyzing
+    if ctx.video_processor:
+        # We can't easily access stats in real-time here without more complex shared state or callbacks update UI.
+        # But we can access it when user clicks "Finish"
+        pass
         
-    # --- Workflow Control ---
-    if st.session_state.workflow_state == 'idle':
-        if st.button("Start Analysis", type="primary"):
-            st.session_state.workflow_state = 'preview'
-            st.rerun()
-            
-    elif st.session_state.workflow_state == 'preview':
-        st.info("Adjust your position. Click **Capture Photo** when ready.")
-        
-        col_p1, col_p2 = st.columns([1, 3])
-        with col_p1:
-            if st.button("Capture Photo", type="primary"):
-                st.session_state.workflow_state = 'analyzing'
+    if st.button("Finish Video Check", type="primary"):
+        if ctx.video_processor:
+            stats = ctx.video_processor.get_stats()
+            if stats:
+                st.session_state.results['video'] = stats
+                st.success("Video captured!")
+                st.session_state.workflow_state = 'audio'
                 st.rerun()
-        with col_p2:
-             if st.button("Cancel"):
-                 st.session_state.workflow_state = 'idle'
-                 st.rerun()
-        
-        # Preview Loop
-        preview_placeholder = st.empty()
-        cap = cv2.VideoCapture(0)
-        
-        from video_check import draw_guide
-        
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("Camera not accessible.")
-                    break
-                
-                # Resize for consistency
-                height, width = frame.shape[:2]
-                max_width = 640
-                if width > max_width:
-                    scale = max_width / width
-                    new_height = int(height * scale)
-                    frame = cv2.resize(frame, (max_width, new_height))
-                    
-                draw_guide(frame)
-                
-                # Convert to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                preview_placeholder.image(frame_rgb, channels="RGB")
-                
-                # Small sleep to prevent CPU hogging
-                time.sleep(0.03)
-        finally:
-            cap.release()
+            else:
+                st.warning("No video data captured yet. Make sure the video is playing.")
+        else:
+            st.warning("Please start the video stream first.")
+
+# 3. Audio Check
+elif st.session_state.workflow_state == 'audio':
+    st.header("Step 2: Audio Check")
+    st.info("Click 'Start' on the recorder below. Speak normally for 5 seconds. Then click 'Stop'.")
+    
+    # Audio recorder
+    ctx = webrtc_streamer(
+        key="audio-check",
+        mode=WebRtcMode.SENDONLY,
+        rtc_configuration=RTC_CONFIGURATION,
+        audio_processor_factory=AudioRecorder,
+        media_stream_constraints={"video": False, "audio": True},
+    )
+    
+    if st.button("Analyze Recorded Audio", type="primary"):
+        if ctx.audio_processor:
+            # Save to file
+            output_file = "recorded_audio.wav"
+            saved_path = ctx.audio_processor.export(output_file)
             
-    elif st.session_state.workflow_state == 'analyzing':
-        st.session_state.running = True
-        
-        # 1. Video Check
-        st.toast("Starting Video Check...", icon="📷")
-        
-        video_placeholder = st.empty()
-        
-        def update_video_frame(frame):
-            # Convert BGR to RGB for Streamlit
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(frame_rgb, channels="RGB")
-            return False # Don't stop
-            
-        # Run Video Check (Countdown + Capture)
-        # We pass on_frame to render the countdown in Streamlit
-        video_res = check_video_quality(duration=video_duration, on_frame=update_video_frame)
-        
-        if "error" in video_res:
-            st.error(f"Video Check Failed: {video_res['error']}")
-            st.session_state.running = False
-            st.session_state.workflow_state = 'idle'
-            st.stop()
-            
-        video_placeholder.empty() # Clear video after check
-        st.session_state.results['video'] = video_res
-        
-        # 2. Audio Check
-        audio_msg = st.empty()
-        audio_msg.info("Get ready for Audio Check...")
-        time.sleep(1)
-        for i in range(3, 0, -1):
-            audio_msg.markdown(f"### Recording in {i}...")
-            time.sleep(1)
-        audio_msg.markdown("### 🎙️ Speak now!")
-        
-        audio_res = check_audio_quality(duration=audio_duration, device_index=selected_device_index)
-        audio_msg.empty() # Clear message
-        st.session_state.results['audio'] = audio_res
-        
-        # 3. Network Check
-        st.toast("Checking Network...", icon="🌐")
+            if saved_path:
+                st.toast("Analyzing Audio...")
+                audio_res = analyze_audio_file(saved_path)
+                st.session_state.results['audio'] = audio_res
+                st.session_state.workflow_state = 'network'
+                st.rerun()
+            else:
+                st.warning("No audio recorded. Did you speak?")
+        else:
+             st.warning("Please start the recording first.")
+
+# 4. Network Check
+elif st.session_state.workflow_state == 'network':
+    st.header("Step 3: Network Check")
+    st.info("Checking connection speed...")
+    
+    with st.spinner("Testing Download & Upload speeds..."):
         network_res = check_network_quality()
         st.session_state.results['network'] = network_res
-        
-        st.session_state.running = False
-        st.session_state.workflow_state = 'idle' # Reset for next time
-        st.success("Analysis Complete!")
-        st.rerun() # Rerun to update time and layout
+        st.session_state.workflow_state = 'complete'
+        st.rerun()
 
-if 'video' in st.session_state.results:
+# 5. Results / Dashboard
+elif st.session_state.workflow_state == 'complete':
     res = st.session_state.results
     
     # Analyze
-    v_rating, v_recs = analyze_video_results(res['video'])
-    a_rating, a_recs = analyze_audio_results(res['audio'])
-    n_rating, n_recs = analyze_network_results(res['network'])
+    v_res = res.get('video', {})
+    a_res = res.get('audio', {})
+    n_res = res.get('network', {})
     
-    # Display Dashboard
+    v_rating, v_recs = analyze_video_results(v_res)
+    a_rating, a_recs = analyze_audio_results(a_res)
+    n_rating, n_recs = analyze_network_results(n_res)
+    
+    # Dashboard UI
     col1, col2, col3 = st.columns(3)
     
     with col1:
         st.subheader("Video")
-        
-        # Recommendations at Very Top
         if v_recs:
-            for rec in v_recs:
-                st.warning(rec, icon="⚠️")
+             for rec in v_recs: st.warning(rec, icon="⚠️")
         else:
-            st.success("Video looks good!", icon="✅")
-            
+             st.success("Video looks good!", icon="✅")
         st.metric("Rating", v_rating)
         st.divider()
-
-        # Display Last Frame directly from memory
-        if "last_frame" in res['video'] and res['video']['last_frame'] is not None:
-            st.image(res['video']['last_frame'], caption=f"Captured at {datetime.datetime.now().strftime('%H:%M:%S')}")
-        elif "photo_path" in res['video']:
-             st.image(res['video']['photo_path'], caption="Captured Frame (File)")
-
-        # Metrics with Stars
-        b_val = res['video'].get('avg_brightness', 0)
-        s_val = res['video'].get('avg_sharpness', 0)
         
-        # Recalibrated ranges based on user feedback
-        st.write(f"**Brightness:** {get_star_rating(b_val, 40, 130)} ({b_val:.1f}) `Target: >40`")
-        st.write(f"**Sharpness:** {get_star_rating(s_val, 50, 300)} ({s_val:.1f}) `Target: >50`")
+        if "last_frame" in v_res:
+             st.image(v_res['last_frame'], caption="Captured Frame")
+             
+        b_val = v_res.get('avg_brightness', 0)
+        s_val = v_res.get('avg_sharpness', 0)
+        st.write(f"**Brightness:** {get_star_rating(b_val, 40, 130)} ({b_val:.1f})")
+        st.write(f"**Sharpness:** {get_star_rating(s_val, 50, 300)} ({s_val:.1f})")
         
-        if res['video'].get('face_detected'):
-            h_val = res['video'].get('avg_headroom', 0)
-            fb_val = res['video'].get('avg_face_brightness', 0)
-            fp_val = res['video'].get('avg_face_prop', 0)
-            
-            # Headroom ideal is ~15%. Deviation from 15 is bad.
-            h_score = 100 - abs(h_val - 15) * 3 
-            st.write(f"**Headroom:** {get_star_rating(h_score, 0, 100)} ({h_val:.1f}%) `Target: ~15%`", help="Percentage of screen height above your head.")
-            
-            # Face Proportion: Ideal > 0.3
-            st.write(f"**Face Size:** {get_star_rating(fp_val, 0.2, 0.5)} ({(fp_val*100):.1f}%) `Target: 20-50%`")
-            st.write(f"**Face Brightness:** {get_star_rating(fb_val, 30, 130)} ({fb_val:.1f}) `Target: >40`")
+        if v_res.get('face_detected'):
+             h_val = v_res.get('avg_headroom', 0)
+             st.write(f"**Headroom:** {get_star_rating(100 - abs(h_val - 15)*3, 0, 100)} ({h_val:.1f}%)")
         else:
-            st.warning("No face detected.")
-            
+             st.warning("No face detected.")
+
     with col2:
         st.subheader("Audio")
-        
-        # Recommendations at Very Top
         if a_recs:
-            for rec in a_recs:
-                st.warning(rec, icon="⚠️")
+             for rec in a_recs: st.warning(rec, icon="⚠️")
         else:
-            st.success("Audio sounds clear!", icon="✅")
-            
+             st.success("Audio sounds clear!", icon="✅")
         st.metric("Rating", a_rating)
         st.divider()
+        
+        vol_val = a_res.get('decibels', -100)
+        snr_val = a_res.get('snr_db', 0)
+        st.write(f"**Volume:** {get_star_rating(vol_val, -70, -35)} ({vol_val:.1f} dB)")
+        st.write(f"**SNR:** {get_star_rating(snr_val, 10, 50)} ({snr_val:.1f} dB)")
+        
+        if "audio_path" in a_res:
+             st.audio(a_res['audio_path'])
 
-        st.write(f"**Source:** {res['audio'].get('device_name', 'Unknown')}")
-        
-        vol_val = res['audio'].get('decibels', -100)
-        snr_val = res['audio'].get('snr_db', 0)
-        
-        # Recalibrated Volume: -70 to -35
-        st.write(f"**Volume:** {get_star_rating(vol_val, -70, -35)} ({vol_val:.1f} dB) `Target: >-65 dB`")
-        st.write(f"**Noise (SNR):** {get_star_rating(snr_val, 10, 50)} ({snr_val:.1f} dB) `Target: >20 dB`")
-        
-        if "audio_path" in res['audio']:
-            st.audio(res['audio']['audio_path'])
-            
     with col3:
         st.subheader("Network")
-        
-        # Recommendations at Very Top
         if n_recs:
-            for rec in n_recs:
-                st.warning(rec, icon="⚠️")
+             for rec in n_recs: st.warning(rec, icon="⚠️")
         else:
-            st.success("Network is stable!", icon="✅")
-            
+             st.success("Network stable!", icon="✅")
         st.metric("Rating", n_rating)
         st.divider()
         
-        d_val = res['network'].get('download_mbps', 0)
-        u_val = res['network'].get('upload_mbps', 0)
-        p_val = res['network'].get('ping_ms', 999)
+        d_val = n_res.get('download_mbps', 0)
+        u_val = n_res.get('upload_mbps', 0)
+        p_val = n_res.get('ping_ms', 999)
+        st.write(f"**Download:** {d_val:.1f} Mbps")
+        st.write(f"**Upload:** {u_val:.1f} Mbps")
+        st.write(f"**Ping:** {p_val:.0f} ms")
         
-        st.write(f"**Download:** {get_star_rating(d_val, 0, 100)} ({d_val:.1f} Mbps)")
-        st.write(f"**Upload:** {get_star_rating(u_val, 0, 20)} ({u_val:.1f} Mbps)")
-        st.write(f"**Ping:** {get_star_rating(p_val, 0, 100, inverse=True)} ({p_val:.0f} ms)")
-
     st.divider()
-    
-    st.subheader("Recommendations")
-    all_recs = v_recs + a_recs + n_recs
-    if all_recs:
-        for rec in all_recs:
-            st.warning(rec)
-    else:
-        st.success("Everything looks great! You are ready for your call.")
-
-else:
-    st.info("Click 'Run Analysis' in the sidebar to start.")
+    if st.button("Run Again", type="primary"):
+        st.session_state.workflow_state = 'idle'
+        st.rerun()

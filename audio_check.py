@@ -1,109 +1,139 @@
-import sounddevice as sd
+
 import numpy as np
-import scipy.io.wavfile as wav
 import os
+from pydub import AudioSegment
+import av
+import threading
+import io
 
-def list_input_devices():
-    """
-    Returns a list of input devices (index, name).
-    """
-    devices = sd.query_devices()
-    input_devices = []
-    for i, dev in enumerate(devices):
-        if dev['max_input_channels'] > 0:
-            input_devices.append((i, dev['name']))
-    return input_devices
+class AudioRecorder:
+    def __init__(self):
+        self.frames_lock = threading.Lock()
+        self.frames = []
+        
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        with self.frames_lock:
+            self.frames.append(frame)
+        return frame
+        
+    def export(self, output_path):
+        """
+        Exports recorded frames to a WAV file.
+        """
+        with self.frames_lock:
+            frames = self.frames.copy()
+            
+        if not frames:
+            return None
+            
+        # Combine all frames
+        # Assuming all frames have same rate/channels
+        
+        # Method: Convert each av.AudioFrame to bytes and stick them together?
+        # Better: Uses pydub or av container to write.
+        
+        # Let's use pydub to construct from raw bytes provided by av
+        # av.AudioFrame.to_ndarray() returns numpy array
+        
+        output_data = io.BytesIO()
+        container = av.open(output_data, mode='w', format='wav')
+        stream = container.add_stream('pcm_s16le', rate=frames[0].rate)
+        stream.layout = str(frames[0].layout.name) # e.g. 'stereo' or 'mono'
+        
+        for frame in frames:
+            for packet in stream.encode(frame):
+                container.mux(packet)
+                
+        # Flush
+        for packet in stream.encode():
+            container.mux(packet)
+            
+        container.close()
+        output_data.seek(0)
+        
+        # Write to file
+        with open(output_path, 'wb') as f:
+            f.write(output_data.getvalue())
+            
+        return output_path
 
-def check_audio_quality(duration=5, samplerate=44100, output_file="test_audio.wav", device_index=None):
+def analyze_audio_file(audio_path):
     """
-    Records audio, identifies source, saves to file, and analyzes quality.
+    Analyzes an audio file (WAV/WEBM) for quality metrics.
     """
-    print(f"Starting audio check for {duration} seconds... Please speak normally.")
-    
     try:
-        # Get device info
-        if device_index is not None:
-            device_info = sd.query_devices(device_index, kind='input')
-        else:
-            device_info = sd.query_devices(kind='input')
+        # Load audio file
+        audio = AudioSegment.from_file(audio_path)
+        
+        # Convert to mono and get raw data
+        audio = audio.set_channels(1)
+        samples = np.array(audio.get_array_of_samples())
+        
+        # If empty
+        if len(samples) == 0:
+            return {"error": "Empty audio file"}
             
-        device_name = device_info['name']
-        print(f"Using Microphone: {device_name}")
+        samplerate = audio.frame_rate
         
-        # Record audio
-        recording = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='float64', device=device_index)
-        sd.wait()
+        # Audio Analysis Logic
         
-        # Save to file (convert to 16-bit PCM)
-        wav_data = (recording * 32767).astype(np.int16)
-        wav.write(output_file, samplerate, wav_data)
+        # 1. RMS & dB
+        samples_float = samples.astype(np.float64)
+        max_possible_val = (2 ** (audio.sample_width * 8 - 1)) if audio.sample_width < 4 else 1.0 # Rough approx
+        # For simplicity, just use standard int16 max
+        if audio.sample_width == 2:
+            max_possible_val = 32768.0
+        elif audio.sample_width == 4:
+            max_possible_val = 2147483648.0
+        else:
+            max_possible_val = 32768.0
+            
+        rms = np.sqrt(np.mean(samples_float**2))
         
-        # Flatten the array for analysis
-        audio_data = recording.flatten()
+        # dBFS
+        db = 20 * np.log10(rms / max_possible_val + 1e-9)
         
-        # Calculate RMS (Root Mean Square) Amplitude
-        rms = np.sqrt(np.mean(audio_data**2))
+        # Peak
+        peak = np.max(np.abs(samples_float))
         
-        # Convert to Decibels (dB)
-        db = 20 * np.log10(rms + 1e-9)
+        # 2. Noise Floor & SNR
+        chunk_len_ms = 100
+        chunk_size = int(samplerate * (chunk_len_ms / 1000))
         
-        # Peak amplitude
-        peak = np.max(np.abs(audio_data))
-        
-        # Noise Floor & SNR Calculation
-        # Split into small chunks (e.g., 100ms) to find silent parts
-        chunk_size = int(samplerate * 0.1)
-        # Pad if needed to make divisible
-        pad_length = chunk_size - (len(audio_data) % chunk_size)
+        # Pad and reshape
+        pad_length = chunk_size - (len(samples_float) % chunk_size)
         if pad_length < chunk_size:
-            audio_padded = np.pad(audio_data, (0, pad_length))
+            samples_padded = np.pad(samples_float, (0, pad_length))
         else:
-            audio_padded = audio_data
+            samples_padded = samples_float
             
-        chunks = audio_padded.reshape(-1, chunk_size)
-        chunk_rms = np.sqrt(np.mean(chunks**2, axis=1))
-        
-        # Assume the quietest 10% of chunks represent the noise floor
-        sorted_rms = np.sort(chunk_rms)
-        noise_floor_rms = np.mean(sorted_rms[:max(1, int(len(sorted_rms) * 0.1))])
-        noise_floor_db = 20 * np.log10(noise_floor_rms + 1e-9)
-        
-        # Signal to Noise Ratio
-        # Signal is the RMS of the whole clip (or maybe the loud parts, but whole clip RMS is standard simple metric)
-        # Better: Signal = Average of top 50% loudest chunks
-        signal_rms = np.mean(sorted_rms[int(len(sorted_rms) * 0.5):])
-        signal_db = 20 * np.log10(signal_rms + 1e-9)
-        
-        snr_db = signal_db - noise_floor_db
-        
+        chunks = samples_padded.reshape(-1, chunk_size)
+        if len(chunks) > 0:
+            chunk_rms = np.sqrt(np.mean(chunks**2, axis=1))
+            sorted_rms = np.sort(chunk_rms)
+            
+            # Noise floor (quietest 10%)
+            noise_floor_rms = np.mean(sorted_rms[:max(1, int(len(sorted_rms) * 0.1))])
+            noise_floor_db = 20 * np.log10(noise_floor_rms / max_possible_val + 1e-9)
+            
+            # Signal (loudest 50%)
+            signal_rms = np.mean(sorted_rms[int(len(sorted_rms) * 0.5):])
+            signal_db = 20 * np.log10(signal_rms / max_possible_val + 1e-9)
+            
+            snr_db = signal_db - noise_floor_db
+        else:
+            noise_floor_db = -90
+            snr_db = 0
+            
         return {
             "rms_amplitude": rms,
             "decibels": db,
             "peak_amplitude": peak,
             "noise_floor_db": noise_floor_db,
             "snr_db": snr_db,
-            "device_name": device_name,
-            "audio_path": os.path.abspath(output_file)
+            "audio_path": audio_path,
+            "duration_sec": len(audio) / 1000.0
         }
         
     except Exception as e:
         return {"error": str(e)}
-
-def play_audio(file_path):
-    """
-    Plays back the recorded audio file.
-    """
-    try:
-        samplerate, data = wav.read(file_path)
-        sd.play(data, samplerate)
-        sd.wait()
-    except Exception as e:
-        print(f"Error playing audio: {e}")
-
-if __name__ == "__main__":
-    # Test run
-    results = check_audio_quality()
-    print(results)
-    if "audio_path" in results:
-        print("Playing back...")
-        play_audio(results["audio_path"])

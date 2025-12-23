@@ -1,8 +1,9 @@
 opencv-python-headless
-sounddevice
 numpy
 speedtest-cli
 rich
 scipy
 streamlit
 requests
+streamlit-webrtc
+pydub
