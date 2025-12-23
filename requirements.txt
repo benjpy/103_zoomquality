@@ -6,4 +6,4 @@ scipy
 streamlit
 requests
 streamlit-webrtc
-pydub
+

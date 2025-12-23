@@ -1,7 +1,7 @@
 
 import numpy as np
 import os
-from pydub import AudioSegment
+import scipy.io.wavfile as wav
 import av
 import threading
 import io
@@ -26,15 +26,6 @@ class AudioRecorder:
         if not frames:
             return None
             
-        # Combine all frames
-        # Assuming all frames have same rate/channels
-        
-        # Method: Convert each av.AudioFrame to bytes and stick them together?
-        # Better: Uses pydub or av container to write.
-        
-        # Let's use pydub to construct from raw bytes provided by av
-        # av.AudioFrame.to_ndarray() returns numpy array
-        
         output_data = io.BytesIO()
         container = av.open(output_data, mode='w', format='wav')
         stream = container.add_stream('pcm_s16le', rate=frames[0].rate)
@@ -59,53 +50,58 @@ class AudioRecorder:
 
 def analyze_audio_file(audio_path):
     """
-    Analyzes an audio file (WAV/WEBM) for quality metrics.
+    Analyzes an audio file (WAV) for quality metrics using scipy.
     """
     try:
-        # Load audio file
-        audio = AudioSegment.from_file(audio_path)
-        
-        # Convert to mono and get raw data
-        audio = audio.set_channels(1)
-        samples = np.array(audio.get_array_of_samples())
+        # Load audio file using scipy
+        # returns (samplerate, data)
+        try:
+            samplerate, data = wav.read(audio_path)
+        except ValueError:
+            # Scipy might fail on some wav headers, fallback to wave? 
+            # But av usually writes standard wav.
+            return {"error": "Could not read WAV file"}
+            
+        # If stereo, convert to mono by averaging
+        if len(data.shape) > 1:
+            data = np.mean(data, axis=1)
+            
+        # Get raw data as float
+        samples = data.astype(np.float64)
         
         # If empty
         if len(samples) == 0:
             return {"error": "Empty audio file"}
             
-        samplerate = audio.frame_rate
-        
         # Audio Analysis Logic
         
         # 1. RMS & dB
-        samples_float = samples.astype(np.float64)
-        max_possible_val = (2 ** (audio.sample_width * 8 - 1)) if audio.sample_width < 4 else 1.0 # Rough approx
-        # For simplicity, just use standard int16 max
-        if audio.sample_width == 2:
-            max_possible_val = 32768.0
-        elif audio.sample_width == 4:
-            max_possible_val = 2147483648.0
-        else:
-            max_possible_val = 32768.0
+        # data is likely int16 (-32768 to 32767) if written as pcm_s16le
+        # Normalized dBFS logic
+        
+        # Determine bit depth roughly
+        # If max value > 32767, likely int32 or float.
+        # But we wrote pcm_s16le, so it should be int16.
+        max_possible_val = 32768.0
             
-        rms = np.sqrt(np.mean(samples_float**2))
+        rms = np.sqrt(np.mean(samples**2))
         
         # dBFS
         db = 20 * np.log10(rms / max_possible_val + 1e-9)
         
         # Peak
-        peak = np.max(np.abs(samples_float))
+        peak = np.max(np.abs(samples))
         
         # 2. Noise Floor & SNR
         chunk_len_ms = 100
         chunk_size = int(samplerate * (chunk_len_ms / 1000))
         
         # Pad and reshape
-        pad_length = chunk_size - (len(samples_float) % chunk_size)
+        pad_length = chunk_size - (len(samples) % chunk_size)
         if pad_length < chunk_size:
-            samples_padded = np.pad(samples_float, (0, pad_length))
+            samples_padded = np.pad(samples, (0, pad_length))
         else:
-            samples_padded = samples_float
+            samples_padded = samples
             
         chunks = samples_padded.reshape(-1, chunk_size)
         if len(chunks) > 0:
@@ -132,7 +128,7 @@ def analyze_audio_file(audio_path):
             "noise_floor_db": noise_floor_db,
             "snr_db": snr_db,
             "audio_path": audio_path,
-            "duration_sec": len(audio) / 1000.0
+            "duration_sec": len(samples) / samplerate
         }
         
     except Exception as e:
